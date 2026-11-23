@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NEON DODGE — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060f; height: 100%; overflow: hidden; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #05060f; touch-action: none; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 14px; text-align: center;
+    color: #8b93b8; font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
+    pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="540" height="960"></canvas></div>
+<div id="hint">← → move &nbsp;·&nbsp; dodge the blocks &nbsp;·&nbsp; 3 lives</div>
+<script>
+"use strict";
+// NEON DODGE — the whole game, written from a single prompt:
+// "Build a tiny neon arcade game: dodge the falling blocks, 3 lives, score, faster over time."
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+const params = new URLSearchParams(location.search);
+const DEMO = params.get("demo") === "1";          // autopilot: the game plays itself (for the video)
+const DEMO_T = Number(params.get("t") || "0");     // fixed clock for deterministic captures
+
+const COLORS = ["#ff2d78", "#00e5ff", "#ffe600", "#7c4dff", "#00ff9d"];
+const player = { x: W / 2, y: H - 120, w: 64, h: 26, speed: 9, vx: 0 };
+let blocks = [];
+let score = 0, lives = 3, level = 1, frame = 0;
+let state = "ready"; // ready | playing | over
+let spawnTimer = 0, elapsed = 0;
+let keys = {};
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function spawnBlock() {
+  const w = rand(34, 86);
+  // Leave a survivable corridor: never spawn on top of a block still near
+  // the top — pick an x clear of every block above y 320.
+  let x = rand(8, W - w - 8);
+  for (let tries = 0; tries < 12; tries++) {
+    const blocked = blocks.some(b => b.y < 320 && x < b.x + b.w + 70 && x + w + 70 > b.x);
+    if (!blocked) break;
+    x = rand(8, W - w - 8);
+  }
+  // Blocks enter just below the HUD strip (y 140) so they never cover the score.
+  blocks.push({
+    x: x, y: 140, w: w, h: rand(18, 30),
+    vy: rand(2.8, 4.0) + level * 0.5, color: pick(COLORS), rot: rand(-0.12, 0.12)
+  });
+}
+
+function reset() {
+  blocks = []; score = 0; lives = 3; level = 1; frame = 0;
+  player.x = W / 2; elapsed = 0; spawnTimer = 0;
+}
+
+function startGame() {
+  reset();
+  state = "playing";
+  document.getElementById("hint").style.display = "none";
+}
+
+// Demo autopilot: steer toward the widest gap between the blocks above.
+function autopilot() {
+  const danger = blocks.filter(b => b.y > player.y - 420 && b.y < player.y + 40);
+  if (!danger.length) { player.vx = 0; return; }
+  let bestX = player.x, bestGap = -1;
+  for (let x = 30; x <= W - 30; x += 30) {
+    let gap = Infinity;
+    for (const b of danger) {
+      const dx = Math.abs((b.x + b.w / 2) - x);
+      gap = Math.min(gap, dx - b.w / 2);
+    }
+    if (gap > bestGap) { bestGap = gap; bestX = x; }
+  }
+  player.vx = Math.max(-player.speed, Math.min(player.speed, (bestX - player.x) * 0.25));
+}
+
+function update() {
+  frame++;
+  // On the game-over screen the world keeps falling behind the text, so the
+  // scene never freezes; in demo mode the autopilot restarts by itself.
+  if (state === "over") {
+    for (const b of blocks) { b.y += b.vy; }
+    blocks = blocks.filter(b => b.y < H + 60);
+    if (DEMO && frame % 90 === 0) startGame();
+    if (flash > 0) flash--;
+    return;
+  }
+  if (state !== "playing") return;
+  elapsed += 1 / 60;
+  level = 1 + Math.floor(elapsed / 12);
+  score += 1;
+
+  if (DEMO) autopilot();
+  else {
+    player.vx = 0;
+    if (keys["ArrowLeft"] || keys["a"]) player.vx -= player.speed;
+    if (keys["ArrowRight"] || keys["d"]) player.vx += player.speed;
+  }
+  player.x = Math.max(20, Math.min(W - 20, player.x + player.vx));
+
+  spawnTimer--;
+  if (spawnTimer <= 0) { spawnBlock(); spawnTimer = Math.max(12, 30 - level * 3); }
+
+  for (const b of blocks) { b.y += b.vy; }
+  blocks = blocks.filter(b => b.y < H + 60);
+
+  // Collision: shrink the hitbox a touch so near-misses feel fair.
+  for (const b of blocks) {
+    const overlap = player.x - player.w / 2 + 8 < b.x + b.w &&
+                    player.x + player.w / 2 - 8 > b.x &&
+                    player.y - player.h / 2 + 6 < b.y + b.h &&
+                    player.y + player.h / 2 - 6 > b.y;
+    if (overlap) {
+      blocks.splice(blocks.indexOf(b), 1);
+      lives--;
+      flash = 12;
+      if (lives <= 0) state = "over";
+      break;
+    }
+  }
+}
+
+let flash = 0;
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0a0d24");
+  g.addColorStop(0.6, "#05060f");
+  g.addColorStop(1, "#12041f");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // faint grid, scrolling with the game
+  ctx.strokeStyle = "rgba(0,229,255,0.07)";
+  ctx.lineWidth = 1;
+  const off = (frame * 2) % 48;
+  for (let y = -48 + off; y < H; y += 48) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  for (let x = 0; x <= W; x += 54) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+}
+
+function drawBlocks() {
+  for (const b of blocks) {
+    ctx.save();
+    ctx.translate(b.x + b.w / 2, b.y + b.h / 2);
+    ctx.rotate(b.rot);
+    ctx.shadowColor = b.color; ctx.shadowBlur = 18;
+    ctx.fillStyle = b.color;
+    ctx.fillRect(-b.w / 2, -b.h / 2, b.w, b.h);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fillRect(-b.w / 2, -b.h / 2, b.w, 5);
+    ctx.restore();
+  }
+}
+
+function drawPlayer() {
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 22;
+  ctx.fillStyle = "#00e5ff";
+  ctx.beginPath();
+  ctx.moveTo(0, -player.h / 2 - 8);
+  ctx.lineTo(player.w / 2, player.h / 2);
+  ctx.lineTo(0, player.h / 2 - 6);
+  ctx.lineTo(-player.w / 2, player.h / 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.arc(0, -2, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawHud() {
+  // Solid-ish strip behind the HUD so falling blocks never wash the text out.
+  ctx.fillStyle = "rgba(5,6,15,0.82)";
+  ctx.fillRect(0, 0, W, 140);
+  ctx.strokeStyle = "rgba(0,229,255,0.25)";
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, 140); ctx.lineTo(W, 140); ctx.stroke();
+  ctx.textAlign = "left";
+  ctx.font = "700 30px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText("SCORE " + Math.floor(score / 10), 20, 48);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#ffe600";
+  ctx.fillText("LV " + level, W - 20, 48);
+  // lives as hearts
+  ctx.textAlign = "left";
+  ctx.font = "28px 'Segoe UI', system-ui, sans-serif";
+  let hearts = "";
+  for (let i = 0; i < 3; i++) hearts += i < lives ? "♥ " : "♡ ";
+  ctx.fillStyle = "#ff2d78";
+  ctx.fillText(hearts, 20, 88);
+  ctx.textAlign = "center";
+  ctx.font = "700 26px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillStyle = "#00e5ff";
+  ctx.fillText("NEON DODGE", W / 2, 128);
+}
+
+function drawCenter(text, sub, color) {
+  ctx.textAlign = "center";
+  ctx.font = "800 54px 'Segoe UI', system-ui, sans-serif";
+  ctx.shadowColor = color; ctx.shadowBlur = 26;
+  ctx.fillStyle = color;
+  ctx.fillText(text, W / 2, H / 2 - 30);
+  ctx.shadowBlur = 0;
+  if (sub) {
+    ctx.font = "400 24px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillStyle = "#cfd6ff";
+    ctx.fillText(sub, W / 2, H / 2 + 24);
+  }
+}
+
+function draw() {
+  drawBackground();
+  drawBlocks();
+  if (state !== "over") drawPlayer();
+  drawHud();
+  if (state === "ready") {
+    drawCenter("NEON DODGE", DEMO ? "autopilot on — watch it play" : "tap or press ENTER to start", "#00e5ff");
+  } else if (state === "over") {
+    drawCenter("GAME OVER", "score " + Math.floor(score / 10) + "  ·  tap to retry", "#ff2d78");
+  }
+  if (flash > 0) {
+    flash--;
+    ctx.fillStyle = "rgba(255,45,120," + (flash / 40) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (e.key === "Enter" && state !== "playing") startGame();
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") e.preventDefault();
+});
+addEventListener("keyup", e => { keys[e.key] = false; });
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "playing") { startGame(); return; }
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (W / rect.width);
+  player.x = Math.max(20, Math.min(W - 20, x));
+});
+canvas.addEventListener("pointermove", e => {
+  if (state !== "playing") return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (W / rect.width);
+  player.x = Math.max(20, Math.min(W - 20, x));
+});
+
+if (DEMO) {
+  // Deterministic demo: start at once, fixed seed feel via a steady spawn clock.
+  startGame();
+}
+loop();
+</script>
+</body>
+</html>
